@@ -1,6 +1,7 @@
 use std::borrow::Cow;
+use std::arch::x86_64::*;
 
-use crate::util::{relu, sigmoid_approx, tansig_approx, zip3};
+use crate::util::{relu, relu_simd, sigmoid_approx, sigmoid_approx_simd, tansig_approx, zip3};
 
 const MAX_NEURONS: usize = 128;
 
@@ -270,6 +271,21 @@ impl DenseLayer {
             }
         }
     }
+
+    fn compute_simd(&self, output: &mut [f32], input: &[f32]) {
+        copy_i8_simd(output, &self.bias[..]);
+        self.matrix().mul_add_simd(output, input);
+
+        match self.activation {
+            Activation::Sigmoid => sigmoid_approx_simd(output),
+            Activation::Tanh => {
+                for out in output.iter_mut() {
+                    *out = tansig_approx(*out * WEIGHTS_SCALE);
+                }
+            }
+            Activation::Relu => relu_simd(output),
+        }
+    }
 }
 
 impl GruLayer {
@@ -321,6 +337,38 @@ impl GruLayer {
                 Activation::Sigmoid => sigmoid_approx(WEIGHTS_SCALE * h),
                 Activation::Tanh => tansig_approx(WEIGHTS_SCALE * h),
                 Activation::Relu => relu(WEIGHTS_SCALE * h),
+            };
+            *s = z * *s + (1.0 - z) * h;
+        }
+    }
+
+    fn compute_simd(&self, state: &mut [f32], input: &[f32]) {
+        let mut z = [0.0; MAX_NEURONS];
+        let mut r = [0.0; MAX_NEURONS];
+        let mut h = [0.0; MAX_NEURONS];
+        let n = self.nb_neurons;
+
+        copy_i8_simd(&mut z[0..n], &self.bias[0..n]);
+        self.input_submatrix(0).mul_add_simd(&mut z[0..n], input);
+        self.rec_submatrix(0).mul_add_simd(&mut z[0..n], &state[..]);
+        sigmoid_approx_simd(&mut z[0..n]);
+
+        copy_i8_simd(&mut r[0..n], &self.bias[n..(2 * n)]);
+        self.input_submatrix(n).mul_add_simd(&mut r[0..n], input);
+        self.rec_submatrix(n).mul_add_simd(&mut r[0..n], &state[..]);
+        for (out, &s) in r[0..n].iter_mut().zip(&state[..]) {
+            *out = s * sigmoid_approx(*out * WEIGHTS_SCALE);
+        }
+
+        copy_i8_simd(&mut h[0..n], &self.bias[(2 * n)..]);
+        self.input_submatrix(2 * n).mul_add_simd(&mut h[0..n], input);
+        self.rec_submatrix(2 * n).mul_add_simd(&mut h[0..n], &r[0..n]);
+
+        for (s, &z, &h) in zip3(state, &z[0..n], &h[0..n]) {
+            let h = match self.activation {
+                Activation::Sigmoid => sigmoid_approx(*h * WEIGHTS_SCALE),
+                Activation::Tanh => tansig_approx(*h * WEIGHTS_SCALE),
+                Activation::Relu => relu(*h * WEIGHTS_SCALE),
             };
             *s = z * *s + (1.0 - z) * h;
         }
@@ -393,6 +441,22 @@ fn copy_i8(dst: &mut [f32], src: &[i8]) {
     }
 }
 
+fn copy_i8_simd(dst: &mut [f32], src: &[i8]) {
+    let len = dst.len();
+    let mut i = 0;
+    while i + 8 <= len {
+        unsafe {
+            let chunk = _mm_loadl_epi64(src.as_ptr().add(i) as *const __m128i);
+            let chunk_f32 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(chunk));
+            _mm_storeu_ps(dst.as_mut_ptr().add(i), chunk_f32);
+        }
+        i += 4;
+    }
+    for (x, y) in dst.iter_mut().zip(&src[i..]) {
+        *x = *y as f32;
+    }
+}
+
 struct SubMatrix<'a> {
     data: &'a [i8],
     stride: usize,
@@ -404,6 +468,34 @@ impl<'a> SubMatrix<'a> {
         for (col, input) in self.data.chunks_exact(self.stride).zip(input) {
             for (&x, out) in col[self.offset..].iter().zip(&mut *output) {
                 *out += x as f32 * input;
+            }
+        }
+    }
+
+    fn mul_add_simd(&self, output: &mut [f32], input: &[f32]) {
+        let n = input.len();
+        let stride = self.stride;
+        let data = self.data.as_ptr();
+
+        let mut i = 0;
+        while i + 8 <= n {
+            unsafe {
+                let mut sum = _mm256_setzero_ps();
+                for j in 0..output.len() {
+                    let weights = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadu_si128(
+                        data.add(j * stride + i) as *const __m128i,
+                    )));
+                    let inp = _mm256_loadu_ps(input.as_ptr().add(i));
+                    let mul = _mm256_mul_ps(weights, inp);
+                    sum = _mm256_add_ps(sum, mul);
+                }
+                _mm256_storeu_ps(output.as_mut_ptr().add(i), sum);
+            }
+            i += 8;
+        }
+        for j in 0..output.len() {
+            for k in i..n {
+                output[j] += self.data[j * stride + k] as f32 * input[k];
             }
         }
     }

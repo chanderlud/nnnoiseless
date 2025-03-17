@@ -1,4 +1,5 @@
 //! Utility functions.
+use std::arch::x86_64::*;
 
 const TANSIG_TABLE: [f32; 201] = [
     0.000000, 0.039979, 0.079830, 0.119427, 0.158649, 0.197375, 0.235496, 0.272905, 0.309507,
@@ -51,6 +52,29 @@ pub(crate) fn sigmoid_approx(x: f32) -> f32 {
 pub(crate) fn relu(x: f32) -> f32 {
     x.max(0.0)
 }
+
+pub(crate) fn sigmoid_approx_simd(x: &mut [f32]) {
+    unsafe {
+        for i in (0..x.len()).step_by(8) {
+            let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+            let tanh_v = _mm256_tanh_ps(_mm256_mul_ps(_mm256_set1_ps(0.5), xv));
+            let result = _mm256_add_ps(_mm256_set1_ps(0.5), _mm256_mul_ps(_mm256_set1_ps(0.5), tanh_v));
+            _mm256_storeu_ps(x.as_mut_ptr().add(i), result);
+        }
+    }
+}
+
+pub(crate) fn relu_simd(x: &mut [f32]) {
+    unsafe {
+        for i in (0..x.len()).step_by(8) {
+            let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+            let zero = _mm256_setzero_ps();
+            let result = _mm256_max_ps(xv, zero);
+            _mm256_storeu_ps(x.as_mut_ptr().add(i), result);
+        }
+    }
+}
+
 
 /// Zip 3 things.
 pub fn zip3<I, J, K>(i: I, j: J, k: K) -> impl Iterator<Item = (I::Item, J::Item, K::Item)>
