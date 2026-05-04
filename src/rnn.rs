@@ -393,18 +393,34 @@ fn copy_i8(dst: &mut [f32], src: &[i8]) {
     }
 }
 
-struct SubMatrix<'a> {
-    data: &'a [i8],
-    stride: usize,
-    offset: usize,
+pub struct SubMatrix<'a> {
+    pub data: &'a [i8],
+    pub stride: usize,
+    pub offset: usize,
 }
 
 impl<'a> SubMatrix<'a> {
-    fn mul_add(&self, output: &mut [f32], input: &[f32]) {
+    pub fn mul_add(&self, output: &mut [f32], input: &[f32]) {
         #[cfg(target_arch = "wasm32")]
         unsafe {
             self.mul_add_wasm(output, input);
             return;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    self.mul_add_avx2(output, input);
+                }
+                return;
+            }
+            if std::is_x86_feature_detected!("avx") {
+                unsafe {
+                    self.mul_add_avx(output, input);
+                }
+                return;
+            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -414,7 +430,7 @@ impl<'a> SubMatrix<'a> {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn mul_add_scalar(&self, output: &mut [f32], input: &[f32]) {
+    pub fn mul_add_scalar(&self, output: &mut [f32], input: &[f32]) {
         let rows = self.data.len() / self.stride;
         let input = &input[..input.len().min(rows)];
         let base = self.offset;
@@ -438,6 +454,145 @@ impl<'a> SubMatrix<'a> {
                 in_idx += 1;
             }
             *out += acc;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    pub unsafe fn mul_add_avx(&self, output: &mut [f32], input: &[f32]) {
+        use core::arch::x86_64::*;
+
+        let rows = self.data.len() / self.stride;
+        let input = &input[..input.len().min(rows)];
+        let base = self.offset;
+        let output_len = output.len().min(self.stride.saturating_sub(base));
+        let mut neuron_idx = 0usize;
+        let chunk = 16usize;
+        let data_ptr = self.data.as_ptr();
+
+        while neuron_idx + chunk <= output_len {
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+
+            for (in_idx, &x) in input.iter().enumerate() {
+                let row_start = in_idx * self.stride + base + neuron_idx;
+                let w_i8 = unsafe { _mm_loadu_si128(data_ptr.add(row_start) as *const __m128i) };
+
+                let w_i8_hi = _mm_srli_si128(w_i8, 8);
+
+                let w_i16_lo = _mm_srai_epi16(_mm_unpacklo_epi8(w_i8, w_i8), 8);
+                let w_i32_lo0 = _mm_srai_epi32(_mm_unpacklo_epi16(w_i16_lo, w_i16_lo), 16);
+                let w_i32_lo1 = _mm_srai_epi32(_mm_unpackhi_epi16(w_i16_lo, w_i16_lo), 16);
+
+                let w_i16_hi = _mm_srai_epi16(_mm_unpacklo_epi8(w_i8_hi, w_i8_hi), 8);
+                let w_i32_hi0 = _mm_srai_epi32(_mm_unpacklo_epi16(w_i16_hi, w_i16_hi), 16);
+                let w_i32_hi1 = _mm_srai_epi32(_mm_unpackhi_epi16(w_i16_hi, w_i16_hi), 16);
+
+                let w_lo = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_mm_cvtepi32_ps(w_i32_lo0)),
+                    _mm_cvtepi32_ps(w_i32_lo1),
+                    1,
+                );
+                let w_hi = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_mm_cvtepi32_ps(w_i32_hi0)),
+                    _mm_cvtepi32_ps(w_i32_hi1),
+                    1,
+                );
+
+                let x8 = _mm256_set1_ps(x);
+                acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(w_lo, x8));
+                acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(w_hi, x8));
+            }
+
+            let out_ptr = unsafe { output.as_mut_ptr().add(neuron_idx) };
+            let out0 = unsafe { _mm256_loadu_ps(out_ptr) };
+            let out1 = unsafe { _mm256_loadu_ps(out_ptr.add(8)) };
+            unsafe {
+                _mm256_storeu_ps(out_ptr, _mm256_add_ps(out0, acc0));
+                _mm256_storeu_ps(out_ptr.add(8), _mm256_add_ps(out1, acc1));
+            }
+
+            neuron_idx += chunk;
+        }
+
+        if neuron_idx < output_len {
+            for (local_idx, out) in output[neuron_idx..output_len].iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                let idx = base + neuron_idx + local_idx;
+                for (in_idx, &x) in input.iter().enumerate() {
+                    acc += self.data[in_idx * self.stride + idx] as f32 * x;
+                }
+                *out += acc;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn mul_add_avx2(&self, output: &mut [f32], input: &[f32]) {
+        use core::arch::x86_64::*;
+
+        let rows = self.data.len() / self.stride;
+        let input = &input[..input.len().min(rows)];
+        let base = self.offset;
+        let output_len = output.len().min(self.stride.saturating_sub(base));
+        let mut neuron_idx = 0usize;
+        let chunk = 32usize;
+        let data_ptr = self.data.as_ptr();
+
+        while neuron_idx + chunk <= output_len {
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut acc2 = _mm256_setzero_ps();
+            let mut acc3 = _mm256_setzero_ps();
+
+            for (in_idx, &x) in input.iter().enumerate() {
+                let row_start = in_idx * self.stride + base + neuron_idx;
+                let w_i8 = unsafe { _mm256_loadu_si256(data_ptr.add(row_start) as *const __m256i) };
+                let w_lo = _mm256_castsi256_si128(w_i8);
+                let w_hi = _mm256_extracti128_si256(w_i8, 1);
+
+                let w_i32_0 = _mm256_cvtepi8_epi32(w_lo);
+                let w_i32_1 = _mm256_cvtepi8_epi32(_mm_srli_si128(w_lo, 8));
+                let w_i32_2 = _mm256_cvtepi8_epi32(w_hi);
+                let w_i32_3 = _mm256_cvtepi8_epi32(_mm_srli_si128(w_hi, 8));
+
+                let w0 = _mm256_cvtepi32_ps(w_i32_0);
+                let w1 = _mm256_cvtepi32_ps(w_i32_1);
+                let w2 = _mm256_cvtepi32_ps(w_i32_2);
+                let w3 = _mm256_cvtepi32_ps(w_i32_3);
+                let x8 = _mm256_set1_ps(x);
+
+                acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(w0, x8));
+                acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(w1, x8));
+                acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(w2, x8));
+                acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(w3, x8));
+            }
+
+            let out_ptr = unsafe { output.as_mut_ptr().add(neuron_idx) };
+            let out0 = unsafe { _mm256_loadu_ps(out_ptr) };
+            let out1 = unsafe { _mm256_loadu_ps(out_ptr.add(8)) };
+            let out2 = unsafe { _mm256_loadu_ps(out_ptr.add(16)) };
+            let out3 = unsafe { _mm256_loadu_ps(out_ptr.add(24)) };
+            unsafe {
+                _mm256_storeu_ps(out_ptr, _mm256_add_ps(out0, acc0));
+                _mm256_storeu_ps(out_ptr.add(8), _mm256_add_ps(out1, acc1));
+                _mm256_storeu_ps(out_ptr.add(16), _mm256_add_ps(out2, acc2));
+                _mm256_storeu_ps(out_ptr.add(24), _mm256_add_ps(out3, acc3));
+            }
+
+            neuron_idx += chunk;
+        }
+
+        if neuron_idx < output_len {
+            for (local_idx, out) in output[neuron_idx..output_len].iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                let idx = base + neuron_idx + local_idx;
+                for (in_idx, &x) in input.iter().enumerate() {
+                    acc += self.data[in_idx * self.stride + idx] as f32 * x;
+                }
+                *out += acc;
+            }
         }
     }
 
@@ -571,6 +726,86 @@ mod tests {
         assert_equal(&actual, &expected);
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    unsafe fn run_mul_add_avx_matches_reference_case() {
+        let rows = 5;
+        let stride = 21;
+        let offset = 2;
+        let data = make_data(rows, stride);
+        let input = vec![0.25, -1.0, 3.0, -0.75, 2.5, 11.0];
+        let mut actual = vec![1.0f32; 19];
+        let mut expected = actual.clone();
+        let matrix = SubMatrix {
+            data: &data,
+            stride,
+            offset,
+        };
+
+        reference_mul_add(&data, stride, offset, &mut expected, &input);
+        matrix.mul_add_avx(&mut actual, &input);
+        assert_equal(&actual, &expected);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    unsafe fn run_mul_add_avx2_matches_reference_case() {
+        let rows = 5;
+        let stride = 21;
+        let offset = 2;
+        let data = make_data(rows, stride);
+        let input = vec![0.25, -1.0, 3.0, -0.75, 2.5, 11.0];
+        let mut actual = vec![1.0f32; 19];
+        let mut expected = actual.clone();
+        let matrix = SubMatrix {
+            data: &data,
+            stride,
+            offset,
+        };
+
+        reference_mul_add(&data, stride, offset, &mut expected, &input);
+        matrix.mul_add_avx2(&mut actual, &input);
+        assert_equal(&actual, &expected);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    unsafe fn run_mul_add_avx_respects_output_bounds_case() {
+        let rows = 4;
+        let stride = 10;
+        let offset = 9;
+        let data = make_data(rows, stride);
+        let input = vec![1.5, -2.0, 0.5, 3.0];
+        let mut actual = vec![5.0f32, 6.0, 7.0, 8.0];
+        let mut expected = actual.clone();
+        let matrix = SubMatrix {
+            data: &data,
+            stride,
+            offset,
+        };
+
+        reference_mul_add(&data, stride, offset, &mut expected, &input);
+        matrix.mul_add_avx(&mut actual, &input);
+        assert_equal(&actual, &expected);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    unsafe fn run_mul_add_avx2_respects_output_bounds_case() {
+        let rows = 4;
+        let stride = 10;
+        let offset = 9;
+        let data = make_data(rows, stride);
+        let input = vec![1.5, -2.0, 0.5, 3.0];
+        let mut actual = vec![5.0f32, 6.0, 7.0, 8.0];
+        let mut expected = actual.clone();
+        let matrix = SubMatrix {
+            data: &data,
+            stride,
+            offset,
+        };
+
+        reference_mul_add(&data, stride, offset, &mut expected, &input);
+        matrix.mul_add_avx2(&mut actual, &input);
+        assert_equal(&actual, &expected);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn mul_add_matches_reference_native() {
@@ -581,6 +816,42 @@ mod tests {
     #[test]
     fn mul_add_respects_output_bounds_native() {
         run_mul_add_respects_output_bounds_case();
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    #[test]
+    fn mul_add_avx_matches_reference() {
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        unsafe { run_mul_add_avx_matches_reference_case() };
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    #[test]
+    fn mul_add_avx2_matches_reference() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe { run_mul_add_avx2_matches_reference_case() };
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    #[test]
+    fn mul_add_avx_respects_output_bounds() {
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        unsafe { run_mul_add_avx_respects_output_bounds_case() };
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))]
+    #[test]
+    fn mul_add_avx2_respects_output_bounds() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe { run_mul_add_avx2_respects_output_bounds_case() };
     }
 
     #[cfg(target_arch = "wasm32")]

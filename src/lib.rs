@@ -24,11 +24,12 @@ pub use dasp;
 mod denoise;
 mod features;
 mod pitch;
-mod rnn;
+#[doc(hidden)]
+pub mod rnn;
 
 pub use denoise::DenoiseState;
 pub use features::DenoiseFeatures;
-pub use rnn::RnnModel;
+pub use rnn::{RnnModel, SubMatrix};
 #[cfg(feature = "dasp")]
 pub use signal::DenoiseSignal;
 
