@@ -93,16 +93,15 @@ impl Biquad {
     /// you had called it once with a longer `input`. The first time you call `filter` on a given
     /// signal, `mem` should be zero.
     pub fn filter(&self, output: &mut [f32], mem: &mut [f32; 2], input: &[f32]) {
-        let a0 = self.a[0] as f64;
-        let a1 = self.a[1] as f64;
-        let b0 = self.b[0] as f64;
-        let b1 = self.b[1] as f64;
+        let a0 = self.a[0];
+        let a1 = self.a[1];
+        let b0 = self.b[0];
+        let b1 = self.b[1];
         for (&x, y) in input.iter().zip(output) {
-            let x64 = x as f64;
-            let y64 = x64 + mem[0] as f64;
-            mem[0] = (mem[1] as f64 + (b0 * x64 - a0 * y64)) as f32;
-            mem[1] = (b1 * x64 - a1 * y64) as f32;
-            *y = y64 as f32;
+            let yi = x + mem[0];
+            mem[0] = mem[1] + (b0 * x - a0 * yi);
+            mem[1] = b1 * x - a1 * yi;
+            *y = yi;
         }
     }
 
@@ -112,16 +111,15 @@ impl Biquad {
     // This is only used when the "train" feature is active.
     #[cfg_attr(not(feature = "train"), allow(dead_code))]
     pub fn filter_in_place(&self, data: &mut [f32], mem: &mut [f32; 2]) {
-        let a0 = self.a[0] as f64;
-        let a1 = self.a[1] as f64;
-        let b0 = self.b[0] as f64;
-        let b1 = self.b[1] as f64;
+        let a0 = self.a[0];
+        let a1 = self.a[1];
+        let b0 = self.b[0];
+        let b1 = self.b[1];
         for x in data {
-            let x64 = *x as f64;
-            let y64 = x64 + mem[0] as f64;
-            mem[0] = (mem[1] as f64 + (b0 * x64 - a0 * y64)) as f32;
-            mem[1] = (b1 * x64 - a1 * y64) as f32;
-            *x = y64 as f32;
+            let yi = *x + mem[0];
+            mem[0] = mem[1] + (b0 * *x - a0 * yi);
+            mem[1] = b1 * *x - a1 * yi;
+            *x = yi;
         }
     }
 }

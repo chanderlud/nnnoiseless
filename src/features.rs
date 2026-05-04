@@ -9,16 +9,21 @@ use crate::{
     common, Complex, CEPS_MEM, FRAME_SIZE, FREQ_SIZE, NB_BANDS, NB_DELTA_CEPS, NB_FEATURES,
     PITCH_BUF_SIZE, WINDOW_SIZE,
 };
-use easyfft::{dyn_size::realfft::DynRealDft, prelude::*};
+use once_cell::sync::OnceCell;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::sync::Arc;
 
 /// Contains the necessary state to compute the features of audio input and synthesize the output.
 ///
 /// This is quite a large struct and should probably be kept behind some kind of pointer.
 #[derive(Clone)]
 pub struct DenoiseFeatures {
-    /// This stores some of the previous input. Currently, whenever we get new input we shift this
-    /// backwards and copy the new input at the end. It might be worth investigating a ring buffer.
-    input_mem: [f32; max(FRAME_SIZE, PITCH_BUF_SIZE)],
+    /// Mirrored ring buffer storing recent input history in two halves.
+    ///
+    /// The second half mirrors the first half to keep recent windows contiguous for the common
+    /// no-wrap case.
+    input_mem: [f32; INPUT_MEM_STORAGE_SIZE],
+    input_mem_head: usize,
     /// This is some sort of ring buffer, storing the last bunch of cepstra.
     cepstral_mem: [[f32; crate::NB_BANDS]; crate::CEPS_MEM],
     /// The index pointing to the most recent cepstrum in `cepstral_mem`. The previous cepstra are
@@ -30,9 +35,11 @@ pub struct DenoiseFeatures {
 
     // What follows are various buffers. The names are cryptic, but they follow a pattern.
     /// The Fourier transform of the most recent frame of input.
-    pub x: DynRealDft<f32>,
+    pub x: Vec<Complex>,
     /// The Fourier transform of a pitch-period-shifted window of input.
-    pub p: DynRealDft<f32>,
+    pub p: Vec<Complex>,
+    fft_forward: Arc<dyn RealToComplex<f32>>,
+    fft_inverse: Arc<dyn ComplexToReal<f32>>,
     /// The band energies of `x` (the signal).
     pub ex: [f32; NB_BANDS],
     /// The band energies of `p` (the signal, lagged by one pitch period).
@@ -52,19 +59,40 @@ const fn max(a: usize, b: usize) -> usize {
         b
     }
 }
+const INPUT_MEM_SIZE: usize = max(FRAME_SIZE, PITCH_BUF_SIZE);
+const INPUT_MEM_STORAGE_SIZE: usize = INPUT_MEM_SIZE * 2;
+type FftPlans = (
+    Arc<dyn RealToComplex<f32>>,
+    Arc<dyn ComplexToReal<f32>>,
+);
+static FFT_PLANS: OnceCell<FftPlans> = OnceCell::new();
+
+fn fft_plans() -> &'static FftPlans {
+    FFT_PLANS.get_or_init(|| {
+        let mut planner = RealFftPlanner::<f32>::new();
+        (
+            planner.plan_fft_forward(WINDOW_SIZE),
+            planner.plan_fft_inverse(WINDOW_SIZE),
+        )
+    })
+}
 
 impl DenoiseFeatures {
     /// Creates a new, empty, `DenoiseFeatures`.
     pub fn new() -> DenoiseFeatures {
+        let (fft_forward, fft_inverse) = fft_plans();
         DenoiseFeatures {
-            input_mem: [0.0; max(FRAME_SIZE, PITCH_BUF_SIZE)],
+            input_mem: [0.0; INPUT_MEM_STORAGE_SIZE],
+            input_mem_head: 0,
             cepstral_mem: [[0.0; NB_BANDS]; CEPS_MEM],
             mem_id: 0,
             mem_hp_x: [0.0; 2],
             synthesis_mem: [0.0; FRAME_SIZE],
             window_buf: [0.0; WINDOW_SIZE],
-            x: DynRealDft::new(0.0, &[Complex::default(); FREQ_SIZE - 1], WINDOW_SIZE),
-            p: DynRealDft::new(0.0, &[Complex::default(); FREQ_SIZE - 1], WINDOW_SIZE),
+            x: vec![Complex::default(); FREQ_SIZE],
+            p: vec![Complex::default(); FREQ_SIZE],
+            fft_forward: Arc::clone(fft_forward),
+            fft_inverse: Arc::clone(fft_inverse),
             ex: [0.0; NB_BANDS],
             ep: [0.0; NB_BANDS],
             exp: [0.0; NB_BANDS],
@@ -83,12 +111,15 @@ impl DenoiseFeatures {
     /// instead.
     pub fn shift_input(&mut self, input: &[f32]) {
         assert!(input.len() == FRAME_SIZE);
-        let new_idx = self.input_mem.len() - FRAME_SIZE;
-        for i in 0..new_idx {
-            self.input_mem[i] = self.input_mem[i + FRAME_SIZE];
-        }
-        for (x, y) in self.input_mem[new_idx..].iter_mut().zip(input) {
-            *x = *y;
+        let write_start = self.input_mem_head;
+        self.input_mem_head = (self.input_mem_head + FRAME_SIZE) % INPUT_MEM_SIZE;
+        let first_len = (INPUT_MEM_SIZE - write_start).min(FRAME_SIZE);
+        self.input_mem[write_start..write_start + first_len].copy_from_slice(&input[..first_len]);
+        self.mirror_primary_segment(write_start, first_len);
+        if first_len < FRAME_SIZE {
+            let second_len = FRAME_SIZE - first_len;
+            self.input_mem[..second_len].copy_from_slice(&input[first_len..]);
+            self.mirror_primary_segment(0, second_len);
         }
     }
 
@@ -96,15 +127,28 @@ impl DenoiseFeatures {
     /// high-pass filter.
     pub fn shift_and_filter_input(&mut self, input: &[f32]) {
         assert!(input.len() == FRAME_SIZE);
-        let new_idx = self.input_mem.len() - FRAME_SIZE;
-        for i in 0..new_idx {
-            self.input_mem[i] = self.input_mem[i + FRAME_SIZE];
+        let write_start = self.input_mem_head;
+        self.input_mem_head = (self.input_mem_head + FRAME_SIZE) % INPUT_MEM_SIZE;
+        let first_len = (INPUT_MEM_SIZE - write_start).min(FRAME_SIZE);
+        crate::util::BIQUAD_HP.filter(
+            &mut self.input_mem[write_start..write_start + first_len],
+            &mut self.mem_hp_x,
+            &input[..first_len],
+        );
+        self.mirror_primary_segment(write_start, first_len);
+        if first_len < FRAME_SIZE {
+            let second_len = FRAME_SIZE - first_len;
+            crate::util::BIQUAD_HP.filter(
+                &mut self.input_mem[..second_len],
+                &mut self.mem_hp_x,
+                &input[first_len..],
+            );
+            self.mirror_primary_segment(0, second_len);
         }
-        crate::util::BIQUAD_HP.filter(&mut self.input_mem[new_idx..], &mut self.mem_hp_x, input);
     }
 
     fn find_pitch(&mut self) -> usize {
-        let input = &self.input_mem[self.input_mem.len().checked_sub(PITCH_BUF_SIZE).unwrap()..];
+        let input = recent_input_slice(&self.input_mem, self.input_mem_head, PITCH_BUF_SIZE, 0);
         let (pitch, _gain) = self.pitch_finder.process(input);
         pitch
     }
@@ -117,18 +161,18 @@ impl DenoiseFeatures {
         let mut tmp = [0.0; NB_BANDS];
 
         transform_input(
-            &self.input_mem,
-            0,
+            recent_input_slice(&self.input_mem, self.input_mem_head, WINDOW_SIZE, 0),
             &mut self.window_buf,
+            &self.fft_forward,
             &mut self.x,
             &mut self.ex,
         );
         let pitch_idx = self.find_pitch();
 
         transform_input(
-            &self.input_mem,
-            pitch_idx,
+            recent_input_slice(&self.input_mem, self.input_mem_head, WINDOW_SIZE, pitch_idx),
             &mut self.window_buf,
+            &self.fft_forward,
             &mut self.p,
             &mut self.ep,
         );
@@ -236,15 +280,8 @@ impl DenoiseFeatures {
         }
         crate::interp_band_gain(&mut rf[..], &r[..]);
         let rf: &mut [f32] = &mut rf;
-        *self.x.get_offset_mut() += self.p.get_offset() * rf[0];
-        for ((x, p), rf) in self
-            .x
-            .get_frequency_bins_mut()
-            .iter_mut()
-            .zip(self.p.get_frequency_bins())
-            .zip(rf[1..].iter())
-        {
-            *x += p * rf;
+        for i in 0..FREQ_SIZE {
+            self.x[i] += self.p[i] * rf[i];
         }
 
         let mut new_e = [0.0; NB_BANDS];
@@ -253,15 +290,22 @@ impl DenoiseFeatures {
             r[i] = (self.ex[i] / (1e-8 + new_e[i])).sqrt();
         }
         crate::interp_band_gain(&mut rf[..], &r[..]);
-        self.x *= &*rf;
+        for i in 0..FREQ_SIZE {
+            self.x[i] *= rf[i];
+        }
     }
 
     pub(crate) fn apply_gain(&mut self, gain: &[f32; FREQ_SIZE]) {
-        self.x *= gain as &[f32];
+        for (x, g) in self.x.iter_mut().zip(gain.iter()) {
+            *x *= *g;
+        }
     }
 
     pub(crate) fn frame_synthesis(&mut self, out: &mut [f32]) {
-        self.x.real_ifft_using(&mut self.window_buf);
+        let fft_inverse = Arc::clone(&self.fft_inverse);
+        fft_inverse
+            .process(&mut self.x, &mut self.window_buf)
+            .expect("inverse real FFT failed");
         // Not too sure why this scaling factor is introduced
         for x in &mut self.window_buf {
             *x /= 2.0;
@@ -273,6 +317,15 @@ impl DenoiseFeatures {
             self.synthesis_mem[i] = self.window_buf[FRAME_SIZE + i];
         }
     }
+
+    fn mirror_primary_segment(&mut self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let (primary, mirrored) = self.input_mem.split_at_mut(INPUT_MEM_SIZE);
+        mirrored[start..start + len].copy_from_slice(&primary[start..start + len]);
+    }
+
 }
 
 /// Fourier transforms the input.
@@ -280,19 +333,37 @@ impl DenoiseFeatures {
 /// The Fourier transform goes in `x` and the band energies go in `ex`.
 fn transform_input(
     input: &[f32],
-    lag: usize,
     window_buf: &mut [f32; WINDOW_SIZE],
-    x: &mut DynRealDft<f32>,
+    fft_forward: &Arc<dyn RealToComplex<f32>>,
+    x: &mut [Complex],
     ex: &mut [f32],
 ) {
-    let input = &input[input.len().checked_sub(WINDOW_SIZE + lag).unwrap()..];
-    crate::apply_window(&mut window_buf[..], input);
-    window_buf.real_fft_using(x);
+    debug_assert_eq!(input.len(), WINDOW_SIZE);
+    debug_assert_eq!(x.len(), FREQ_SIZE);
+    window_buf.copy_from_slice(input);
+    crate::apply_window_in_place(window_buf);
+    fft_forward
+        .process(window_buf, x)
+        .expect("forward real FFT failed");
 
     // In the original RNNoise code, the forward transform is normalized and the inverse
-    // tranform isn't. `rustfft` doesn't normalize either one, so we do it ourselves.
+    // transform isn't. `realfft` doesn't normalize either one, so we do it ourselves.
     let norm = common().wnorm;
-    *x *= norm;
+    for i in 0..FREQ_SIZE {
+        x[i] *= norm;
+    }
 
     crate::compute_band_corr(ex, x, x);
+}
+
+fn recent_input_slice<'a>(
+    input_mem: &'a [f32; INPUT_MEM_STORAGE_SIZE],
+    input_head: usize,
+    len: usize,
+    lag: usize,
+) -> &'a [f32] {
+    assert!(len + lag <= INPUT_MEM_SIZE);
+    let start = INPUT_MEM_SIZE - (len + lag);
+    let idx = input_head + start;
+    &input_mem[idx..idx + len]
 }

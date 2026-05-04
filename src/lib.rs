@@ -56,7 +56,8 @@ pub const EBAND_5MS: [usize; 22] = [
     // 0  200 400 600 800  1k 1.2 1.4 1.6  2k 2.4 2.8 3.2  4k 4.8 5.6 6.8  8k 9.6 12k 15.6 20k*/
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 34, 40, 48, 60, 78, 100,
 ];
-type Complex = easyfft::num_complex::Complex32;
+type Complex = rustfft::num_complex::Complex<f32>;
+const DCT_SCALE: f32 = 0.30151135;
 
 /// Computes the correlation between two frequency-domain signals, and aggregates the correlation
 /// into bands.
@@ -143,14 +144,7 @@ pub(crate) fn dct(out: &mut [f32], x: &[f32]) {
         for j in 0..NB_BANDS {
             sum += x[j] * c.dct_table[j * NB_BANDS + i];
         }
-        out[i] = (sum as f64 * (2.0 / NB_BANDS as f64).sqrt()) as f32;
-    }
-}
-
-fn apply_window(output: &mut [f32], input: &[f32]) {
-    let c = common();
-    for (x, &y, &w) in util::zip3(output, input, &c.window[..]) {
-        *x = y * w;
+        out[i] = sum * DCT_SCALE;
     }
 }
 

@@ -85,6 +85,14 @@ python train/convert_rnnoise.py input_file.txt output_file.rnn
 This is a little involved, but at least it's documented now. See `train/README.md` for
 more information.
 
+## WASM SIMD builds
+
+For `wasm32-unknown-unknown` builds, you can explicit enable SIMD with:
+
+```sh
+RUSTFLAGS="-C target-feature=+simd128" cargo build --target wasm32-unknown-unknown --release
+```
+
 [1]: https://github.com/xiph/rnnoise
 [`RnnModel::from_bytes`]: https://docs.rs/nnnoiseless/latest/nnnoiseless/struct.RnnModel.html#method.from_bytes
 [`RnnModel::from_static_bytes`]: https://docs.rs/nnnoiseless/latest/nnnoiseless/struct.RnnModel.html#method.from_static_bytes
